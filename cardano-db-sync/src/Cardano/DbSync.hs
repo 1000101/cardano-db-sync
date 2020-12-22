@@ -281,7 +281,6 @@ logDbState trce = do
         (Nothing, Just blkNo) -> "block " ++ show blkNo
         (Nothing, Nothing) -> "genesis"
 
-
 getLatestPoints :: LedgerStateDir -> IO [Point CardanoBlock]
 getLatestPoints ledgerStateDir = do
     xs <- listLedgerStateSlotNos ledgerStateDir

@@ -1,5 +1,6 @@
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
@@ -13,12 +14,19 @@ module Cardano.DbSync.LedgerState
   , initLedgerStateVar
   , listLedgerStateSlotNos
   , loadLedgerState
+  , getLatestLedgerState
   , readLedgerState
   , saveLedgerState
   ) where
 
+import qualified Cardano.Api as Api
 import           Cardano.Binary (DecoderError)
 import qualified Cardano.Binary as Serialize
+import qualified Cardano.Chain.Block as Byron
+import           Cardano.Chain.Common (toCompactAddress, decodeAddressBase58, sumLovelace, Lovelace, LovelaceError)
+import qualified Cardano.Chain.UTxO as Byron
+
+import           Cardano.Ledger.Compactible
 
 import           Cardano.DbSync.Config
 import           Cardano.DbSync.Config.Cardano
@@ -41,8 +49,10 @@ import qualified Data.ByteString.Char8 as BS
 import qualified Data.ByteString.Lazy.Char8 as LBS
 import qualified Data.ByteString.Short as BSS
 import qualified Data.List as List
+import qualified Data.Map.Strict as M
 
 import           Ouroboros.Consensus.Block (CodecConfig, WithOrigin (..), blockHash, blockPrevHash)
+import           Ouroboros.Consensus.Byron.Ledger.Ledger
 import           Ouroboros.Consensus.Cardano.Block (CardanoBlock, HardForkState (..),
                    LedgerState (..), StandardCrypto)
 import           Ouroboros.Consensus.Cardano.CanHardFork ()
@@ -61,6 +71,8 @@ import           Ouroboros.Consensus.Storage.Serialisation (DecodeDisk (..), Enc
 import qualified Shelley.Spec.Ledger.API.Protocol as Shelley
 import qualified Shelley.Spec.Ledger.BaseTypes as Shelley
 import qualified Shelley.Spec.Ledger.STS.Tickn as Shelley
+import qualified Shelley.Spec.Ledger.TxBody as Shelley
+import qualified Shelley.Spec.Ledger.UTxO as Shelley
 
 import           System.Directory (listDirectory, removeFile)
 import           System.FilePath (dropExtension, takeExtension, (</>))
@@ -96,6 +108,12 @@ initLedgerStateVar genesisConfig =
       }
   where
     protocolInfo = mkProtocolInfoCardano genesisConfig
+
+getLatestLedgerState :: GenesisConfig -> LedgerStateDir -> Maybe SlotNo -> IO CardanoLedgerState
+getLatestLedgerState genesisConfig stateDir mSlotNo = do
+    stateVar <- initLedgerStateVar genesisConfig
+    loadLedgerState stateDir stateVar mSlotNo
+    readLedgerState stateVar
 
 -- The function 'tickThenReapply' does zero validation, so add minimal validation ('blockPrevHash'
 -- matches the tip hash of the 'LedgerState'). This was originally for debugging but the check is
@@ -159,12 +177,12 @@ saveLedgerState lsd@(LedgerStateDir stateDir) (LedgerStateVar stateVar) ledger s
     codecConfig :: CodecConfig (CardanoBlock StandardCrypto)
     codecConfig = configCodec (clsConfig ledger)
 
-loadLedgerState :: LedgerStateDir -> LedgerStateVar -> SlotNo -> IO ()
-loadLedgerState stateDir (LedgerStateVar stateVar) slotNo = do
+loadLedgerState :: LedgerStateDir -> LedgerStateVar -> Maybe SlotNo -> IO ()
+loadLedgerState stateDir (LedgerStateVar stateVar) mSlotNo = do
   -- Read current state to get the LedgerConfig and CodecConfig.
   lstate <- readLedgerState (LedgerStateVar stateVar)
   -- Load the state
-  mState <- loadState stateDir lstate slotNo
+  mState <- loadState stateDir lstate mSlotNo
   case mState of
     Nothing -> pure ()
     Just st -> atomically $ writeTVar stateVar st
@@ -200,18 +218,22 @@ extractEpochNonce extLedgerState =
     extractNonce =
       Shelley.ticknStateEpochNonce . Shelley.csTickn . Consensus.tpraosStateChainDepState
 
-loadState :: LedgerStateDir -> CardanoLedgerState -> SlotNo -> IO (Maybe CardanoLedgerState)
-loadState stateDir ledger slotNo = do
+loadState :: LedgerStateDir -> CardanoLedgerState -> Maybe SlotNo -> IO (Maybe CardanoLedgerState)
+loadState stateDir ledger mSlotNo = do
     files <- listLedgerStateFilesOrdered stateDir
-    let (invalid, valid) = partitionEithers $ map keepFile files
-    -- Remove invalid (ie SlotNo >= current) ledger state files (occurs on rollback).
-    mapM_ safeRemoveFile invalid
+    valid <- case mSlotNo of
+      Nothing -> return files
+      Just slot -> do
+        let (invalid, valid) = partitionEithers $ map (keepFile slot) files
+        -- Remove invalid (ie SlotNo >= current) ledger state files (occurs on rollback).
+        mapM_ safeRemoveFile invalid
+        return valid
     -- Want the highest numbered snapshot.
     firstJustM loadFile valid
   where
     -- Left files are deleted, Right files are kept.
-    keepFile :: LedgerStateFile ->  Either FilePath LedgerStateFile
-    keepFile lsf@(LedgerStateFile w fp) =
+    keepFile :: SlotNo -> LedgerStateFile ->  Either FilePath LedgerStateFile
+    keepFile slotNo lsf@(LedgerStateFile w fp) =
       if SlotNo w <= slotNo
         then Right lsf
         else Left fp
@@ -305,6 +327,36 @@ ledgerRewardUpdate env lsc =
       LedgerStateShelley sls -> Generic.shelleyRewards env sls
       LedgerStateAllegra als -> Generic.allegraRewards env als
       LedgerStateMary mls -> Generic.maryRewards env mls
+
+-- Given an address, return it's current UTxO balance.
+ledgerAddrBalance :: Text -> LedgerState (CardanoBlock StandardCrypto) -> Either LovelaceError Lovelace
+ledgerAddrBalance addr lsc =
+    case lsc of
+      LedgerStateByron st -> getByronBalance addr $ Byron.cvsUtxo $ byronLedgerState st
+      LedgerStateShelley st -> undefined -- _utxoState $ esLState $ nesEs $ shelleyLedgerState $ st
+      LedgerStateAllegra st -> undefined
+      LedgerStateMary st -> undefined
+
+
+getByronBalance :: Text -> Byron.UTxO -> Either LovelaceError Lovelace
+getByronBalance addrText utxo = do
+    case toCompactAddress <$> decodeAddressBase58 addrText of
+      Left err -> panic $ textShow err
+      Right caddr -> sumLovelace $ mapMaybe (compactTxOutValue caddr) $ M.elems $ Byron.unUTxO utxo
+ where
+  compactTxOutValue caddr (Byron.CompactTxOut caddr' lovelace) = if caddr == caddr'
+      then Just lovelace
+      else Nothing
+
+getShelleyBalance :: Text -> Shelley.UTxO era -> Either LovelaceError Lovelace
+getShelleyBalance addrText utxo =
+    case compactAddr . toShelleyAddr <$> deserialiseAddress (Api.AsAddress Api.AsShelleyAddr) addrText of
+      Nothing -> panic $ textShow $ "failed to serialise " ++ show addrText
+      Just caddr -> sumLovelace $ mapMaybe (compactTxOutValue caddr) $ M.elems $ Shelley.unUTxO utxo
+  where
+    compactTxOutValue caddr (Shelley.TxOut caddr' v) = if caddr == caddr'
+      then Just $ fromCompact v
+      else Nothing
 
 -- Like 'Consensus.tickThenReapply' but also checks that the previous hash from the block matches
 -- the head hash of the ledger state.
